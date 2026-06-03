@@ -54,6 +54,7 @@ config :spark,
 
 config :automatron_ex,
   ecto_repos: [AutomatronEx.Repo],
+  ash_domains: [AutomatronEx.Runs],
   generators: [timestamp_type: :utc_datetime]
 
 # Configure the endpoint
