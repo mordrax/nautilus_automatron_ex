@@ -17,7 +17,8 @@ defmodule AutomatronExWeb.Router do
   scope "/", AutomatronExWeb do
     pipe_through :browser
 
-    get "/", PageController, :home
+    live "/", RunsLive
+    live "/runs/:run_id", RunDetailLive
     live "/instruments", InstrumentsLive
   end
 
