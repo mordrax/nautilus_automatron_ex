@@ -18,6 +18,7 @@ defmodule AutomatronExWeb.Router do
     pipe_through :browser
 
     get "/", PageController, :home
+    live "/instruments", InstrumentsLive
   end
 
   # Other scopes may use custom stacks.
