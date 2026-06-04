@@ -57,6 +57,28 @@ defmodule AutomatronExWeb.RunDetailLiveTest do
     assert_push_event(lv, "chart:focus_trade", %{index: 0})
   end
 
+  test "on connected mount, focuses the initial trade so the chart opens on trade #1",
+       %{conn: conn} do
+    {:ok, lv, _html} = live(conn, ~p"/runs/#{@run}")
+
+    # Beyond chart:init, the connected mount centers the chart on the selected
+    # trade (#1 → index 0), matching the React reference (nae-g9c). Without it the
+    # chart opens on the most-recent bars while the navigator reads "Trade 1".
+    assert_push_event(lv, "chart:focus_trade", %{index: 0})
+  end
+
+  test "chart container stays phx-update=ignore across trade navigation", %{conn: conn} do
+    {:ok, lv, _html} = live(conn, ~p"/runs/#{@run}")
+
+    # #run-chart is owned by the CandlestickChart hook (echarts.init appends the
+    # canvas), so it must be phx-update="ignore" — otherwise a navigator re-render
+    # reconciles the hook-created canvas away and the chart goes blank (nae-ji0).
+    assert lv |> element("#run-chart") |> render() =~ ~s(phx-update="ignore")
+
+    render_click(lv, "next_trade")
+    assert lv |> element("#run-chart") |> render() =~ ~s(phx-update="ignore")
+  end
+
   test "unknown run renders not-found, no crash", %{conn: conn} do
     {:ok, _lv, html} = live(conn, ~p"/runs/does-not-exist")
 

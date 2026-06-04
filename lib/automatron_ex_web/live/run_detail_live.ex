@@ -54,7 +54,9 @@ defmodule AutomatronExWeb.RunDetailLive do
   end
 
   # On the live (connected) mount, load the OHLC bars + trades and deliver them to
-  # the CandlestickChart hook; the trades table renders the same list.
+  # the CandlestickChart hook; the trades table renders the same list. After
+  # init, center the chart on the selected trade (index 0) so it opens on trade #1
+  # rather than the most-recent bars, matching the React reference (nae-g9c).
   defp maybe_push_chart(socket, detail) do
     if connected?(socket) do
       catalog = AutomatronEx.catalog_path()
@@ -64,6 +66,7 @@ defmodule AutomatronExWeb.RunDetailLive do
       socket
       |> assign(:trades, trades)
       |> push_event("chart:init", %{ohlc: ohlc, trades: trades})
+      |> push_event("chart:focus_trade", %{index: socket.assigns.current_index})
     else
       socket
     end
@@ -157,7 +160,13 @@ defmodule AutomatronExWeb.RunDetailLive do
 
         <div class="flex flex-col gap-4 lg:flex-row">
           <div class="min-w-0 flex-1">
-            <div id="run-chart" phx-hook="CandlestickChart" class="h-[480px] w-full"></div>
+            <div
+              id="run-chart"
+              phx-hook="CandlestickChart"
+              phx-update="ignore"
+              class="h-[480px] w-full"
+            >
+            </div>
 
             <div
               :if={@trades != []}
