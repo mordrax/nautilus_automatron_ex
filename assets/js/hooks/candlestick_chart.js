@@ -30,13 +30,17 @@ const computeDefaultStart = (totalBars, visible = DEFAULT_VISIBLE_BARS) => {
   return ((totalBars - visible) / totalBars) * 100
 }
 
-// Ports formatDatetime from lib/trade-utils.ts: "Mon-D HH:MM" in local time.
+// Ports formatDatetime from lib/trade-utils.ts ("Mon-D HH:MM"), but renders in
+// UTC rather than the browser's local time so the chart x-axis matches the
+// trades table's UTC timestamps (fmt_datetime in run_detail_live.ex). This is a
+// deliberate, documented divergence from React's local-time display, chosen for
+// server/client timezone consistency (nae-t2x).
 const formatDatetime = (iso) => {
   const d = new Date(iso)
-  const month = d.toLocaleString("en", {month: "short"})
-  const day = d.getDate()
-  const hours = d.getHours().toString().padStart(2, "0")
-  const mins = d.getMinutes().toString().padStart(2, "0")
+  const month = d.toLocaleString("en", {month: "short", timeZone: "UTC"})
+  const day = d.getUTCDate()
+  const hours = d.getUTCHours().toString().padStart(2, "0")
+  const mins = d.getUTCMinutes().toString().padStart(2, "0")
   return `${month}-${day} ${hours}:${mins}`
 }
 
