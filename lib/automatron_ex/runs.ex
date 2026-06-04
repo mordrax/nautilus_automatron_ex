@@ -12,5 +12,6 @@ defmodule AutomatronEx.Runs do
 
   resources do
     resource AutomatronEx.Runs.Run
+    resource AutomatronEx.Runs.ViewerState
   end
 end
