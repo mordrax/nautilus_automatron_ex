@@ -207,4 +207,101 @@ defmodule AutomatronExWeb.RunDetailLiveTest do
       assert s2.label == "EMA(20)"
     end
   end
+
+  describe "indicator sidebar (Phase 3b — panel oscillators)" do
+    # The chart hook routes the pushed series by `display`: "overlay" stays on the
+    # price axis (3a), "panel" gets its own grid below the candlesticks. The server
+    # contract those panels rely on is that each panel indicator's pushed series
+    # carries display: "panel" and its output keys — asserted here.
+
+    test "adding a single-output panel indicator (RSI) pushes a display:\"panel\" series",
+         %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/runs/#{@run}")
+
+      lv |> form("#add-indicator", %{"type" => "RSI"}) |> render_submit()
+
+      assert_push_event(lv, "chart:set_indicators", %{series: [series]})
+      assert series.display == "panel"
+      assert series.label == "RSI(14)"
+      assert is_list(series.outputs["value"])
+      assert series.color =~ ~r/^#[0-9a-fA-F]{6}$/
+    end
+
+    test "adding a multi-param panel indicator (MACD) seeds both params and computes it",
+         %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/runs/#{@run}")
+
+      lv |> form("#add-indicator", %{"type" => "MACD"}) |> render_submit()
+
+      assert_push_event(lv, "chart:set_indicators", %{series: [series]})
+      assert series.display == "panel"
+      assert series.label == "MACD(12,26)"
+      assert is_list(series.outputs["value"])
+
+      # Both registry params round-trip to viewer-state (not just a single `period`).
+      assert [%{"type" => "MACD", "params" => %{"fast_period" => 12, "slow_period" => 26}}] =
+               ViewerState.get_by_run!(@run).indicators
+    end
+
+    test "adding a multi-output panel indicator (Stochastics) pushes both %K and %D series",
+         %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/runs/#{@run}")
+
+      lv |> form("#add-indicator", %{"type" => "Stochastics"}) |> render_submit()
+
+      assert_push_event(lv, "chart:set_indicators", %{series: [series]})
+      assert series.display == "panel"
+      assert series.label == "Stoch(14,3)"
+      # The hook draws one line per output — Stochastics carries both %K and %D.
+      assert is_list(series.outputs["value_k"])
+      assert is_list(series.outputs["value_d"])
+    end
+
+    test "panel and overlay indicators coexist, each tagged with its own display",
+         %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/runs/#{@run}")
+
+      lv |> form("#add-indicator", %{"type" => "SMA"}) |> render_submit()
+      assert_push_event(lv, "chart:set_indicators", %{series: [_overlay_only]})
+
+      lv |> form("#add-indicator", %{"type" => "RSI"}) |> render_submit()
+      assert_push_event(lv, "chart:set_indicators", %{series: series})
+
+      # The same push carries the 3a overlay and the 3b panel, each routed by display.
+      display_by_label = Map.new(series, &{&1.label, &1.display})
+      assert display_by_label["SMA(20)"] == "overlay"
+      assert display_by_label["RSI(14)"] == "panel"
+    end
+
+    test "editing a multi-param panel (MACD fast_period) recomputes the label and persists",
+         %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/runs/#{@run}")
+      lv |> form("#add-indicator", %{"type" => "MACD"}) |> render_submit()
+      assert_push_event(lv, "chart:set_indicators", %{series: [s]})
+
+      lv |> form("#indicator-#{s.id}", %{"fast_period" => "5"}) |> render_change()
+
+      assert_push_event(lv, "chart:set_indicators", %{series: [s2]})
+      assert s2.label == "MACD(5,26)"
+      assert s2.id == s.id
+
+      assert [%{"params" => %{"fast_period" => 5, "slow_period" => 26}}] =
+               ViewerState.get_by_run!(@run).indicators
+    end
+
+    test "a panel indicator persists and is re-pushed with its display on remount",
+         %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/runs/#{@run}")
+      lv |> form("#add-indicator", %{"type" => "Stochastics"}) |> render_submit()
+      assert_push_event(lv, "chart:set_indicators", %{series: [s]})
+
+      {:ok, lv2, _html2} = live(conn, ~p"/runs/#{@run}")
+
+      assert has_element?(lv2, "#indicator-#{s.id}")
+      assert_push_event(lv2, "chart:set_indicators", %{series: [s2]})
+      assert s2.id == s.id
+      assert s2.display == "panel"
+      assert s2.label == "Stoch(14,3)"
+    end
+  end
 end

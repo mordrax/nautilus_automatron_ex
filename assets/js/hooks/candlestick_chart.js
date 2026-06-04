@@ -3,14 +3,16 @@
 // Owns an eCharts instance and builds the same option object as the React app
 // (packages/client/src/components/chart/CandlestickChart.tsx + lib/chart-config,
 // lib/trade-utils, lib/chart-zoom, hooks/use-trades). Candlestick + trade
-// entry/exit markLines + zoom-to-trade, plus Phase 3a overlay moving-average
-// indicators (SMA/EMA/HMA). Key-levels and secondary panels remain deferred to
-// later Phase 3 slices.
+// entry/exit markLines + zoom-to-trade, plus the registry indicators: Phase 3a
+// overlay moving averages (SMA/EMA/HMA) on the price axis and Phase 3b oscillator
+// panels (RSI/MACD/ATR/Stochastics) in their own grids below the chart. Key-level
+// detectors remain deferred to later Phase 3 slices.
 //
 // Server contract (from RunDetailLive):
 //   chart:init           %{ohlc, trades}  -> (re)build and render the option
 //   chart:focus_trade    %{index}         -> dataZoom centered on that trade
-//   chart:set_indicators %{series}        -> add/update/remove overlay lines
+//   chart:set_indicators %{series}        -> add/update/remove indicator series,
+//                                            routed by each series' `display`
 // Client -> server:
 //   select_trade         %{index}         -> a trade markLine was clicked
 import * as echarts from "echarts"
@@ -31,6 +33,19 @@ const computeDefaultStart = (totalBars, visible = DEFAULT_VISIBLE_BARS) => {
   if (totalBars <= visible) return 0
   return ((totalBars - visible) / totalBars) * 100
 }
+
+// Panel-grid geometry, ported from buildPanelConfig / buildOption in
+// CandlestickChart.tsx. Each display:"panel" indicator gets a fixed-height grid
+// stacked below the main chart (own y-axis, sharing the category x-axis + zoom);
+// the element grows per panel so the candlesticks stay usable. Pixel offsets are
+// measured from the bottom of the (grown) element.
+const DATA_ZOOM_HEIGHT = 40
+const PANEL_HEIGHT = 100
+const PANEL_GAP = 30
+// Base element height (mirrors the run-chart container's h-[480px]) plus the
+// per-panel growth that keeps the main grid large as panels are added.
+const CHART_BASE_HEIGHT = 480
+const PANEL_CONTAINER_GROWTH = 150
 
 // Ports formatDatetime from lib/trade-utils.ts ("Mon-D HH:MM"), but renders in
 // UTC rather than the browser's local time so the chart x-axis matches the
@@ -76,8 +91,9 @@ const buildTradeMarkLines = (trades) =>
   ])
 
 // The candlestick series (rows are [open, close, low, high]) with its per-trade
-// entry->exit markLines. Carries a stable `id` so indicator updates can merge via
-// replaceMerge without rebuilding or disturbing it.
+// entry->exit markLines. Always series index 0; indicator updates rebuild the
+// whole series/grid/axis arrays and replaceMerge them (ports CandlestickChart.tsx),
+// so it is re-sent each time and stays put.
 const buildCandleSeries = (ohlc, trades) => {
   const ohlcValues = ohlc.open.map((_, i) => [
     ohlc.open[i],
@@ -87,7 +103,6 @@ const buildCandleSeries = (ohlc, trades) => {
   ])
 
   return {
-    id: "candlestick",
     name: "Candlestick",
     type: "candlestick",
     data: ohlcValues,
@@ -113,49 +128,142 @@ const buildCandleSeries = (ohlc, trades) => {
   }
 }
 
-// One overlay line per indicator instance (the IndicatorResult shape pushed by
-// RunDetailLive), drawn on the price grid (xAxisIndex/yAxisIndex 0). Keyed by the
-// server-assigned instance id so add/update/remove map to eCharts series through
-// replaceMerge; `connectNulls` bridges the indicator's nil initialization prefix.
-const buildIndicatorSeries = (indicator) => ({
-  id: indicator.id,
-  name: indicator.label,
-  type: "line",
-  data: indicator.outputs?.value ?? [],
-  xAxisIndex: 0,
-  yAxisIndex: 0,
-  connectNulls: true,
-  showSymbol: false,
-  lineStyle: {color: indicator.color, width: 1.5},
-  itemStyle: {color: indicator.color},
-  z: 3,
-})
+// Overlay indicators (display:"overlay") draw on the price grid (xAxisIndex/
+// yAxisIndex 0) — one line per output field (the 3a moving averages each carry a
+// single "value"). `connectNulls` bridges the indicator's nil initialization
+// prefix; `z: 3` keeps the line above the candlesticks. Anything not flagged as a
+// panel falls here. Ports buildIndicatorOverlaySeries from CandlestickChart.tsx.
+const buildOverlaySeries = (indicators) =>
+  indicators
+    .filter((ind) => ind.display !== "panel")
+    .flatMap((ind) => {
+      const fields = Object.keys(ind.outputs ?? {})
+      return fields.map((field) => ({
+        name: fields.length > 1 ? `${ind.label} ${field}` : ind.label,
+        type: "line",
+        data: ind.outputs[field] ?? [],
+        smooth: false,
+        showSymbol: false,
+        connectNulls: true,
+        lineStyle: {color: ind.color, width: 1.5},
+        itemStyle: {color: ind.color},
+        xAxisIndex: 0,
+        yAxisIndex: 0,
+        z: 3,
+      }))
+    })
 
-// Ports buildOption from CandlestickChart.tsx (Phase 3a subset: overlay MAs, no
-// key levels / panels yet). Overlay lines are layered on by chart:set_indicators.
-const buildOption = (ohlc, trades) => {
+// Panel indicators (display:"panel") each get their own grid stacked below the
+// main chart: a fixed-height grid, its own labeled y-axis, and a category x-axis
+// sharing the main chart's data + dataZoom. Multi-output indicators (Stochastics
+// %K/%D) draw one line per output in the same panel. Returns the grids/x-axes/
+// y-axes/series to splice into the option, plus the panel count. Ports
+// buildPanelConfig from CandlestickChart.tsx.
+const buildPanelConfig = (indicators) => {
+  const panels = indicators.filter((ind) => ind.display === "panel")
+  const grids = []
+  const xAxes = []
+  const yAxes = []
+  const series = []
+
+  panels.forEach((ind, panelIdx) => {
+    const gridIdx = panelIdx + 1 // grid 0 is the main candlestick chart
+    const bottomOffset =
+      DATA_ZOOM_HEIGHT + (panels.length - 1 - panelIdx) * (PANEL_HEIGHT + PANEL_GAP)
+
+    grids.push({
+      left: "3%",
+      right: "3%",
+      height: `${PANEL_HEIGHT}px`,
+      bottom: `${bottomOffset}px`,
+    })
+
+    // Only the bottom panel carries the shared datetime axis labels/ticks.
+    const isBottomPanel = panelIdx === panels.length - 1
+    xAxes.push({
+      type: "category",
+      gridIndex: gridIdx,
+      data: ind.datetime,
+      boundaryGap: false,
+      axisLabel: isBottomPanel
+        ? {formatter: (value) => formatDatetime(value), fontSize: 10}
+        : {show: false},
+      axisTick: {show: isBottomPanel},
+    })
+
+    yAxes.push({
+      scale: true,
+      gridIndex: gridIdx,
+      splitNumber: 3,
+      axisLabel: {fontSize: 10},
+      name: ind.label,
+      nameTextStyle: {fontSize: 10, padding: [0, 40, 0, 0]},
+    })
+
+    const fields = Object.keys(ind.outputs ?? {})
+    for (const field of fields) {
+      series.push({
+        name: fields.length > 1 ? `${ind.label} ${field}` : ind.label,
+        type: "line",
+        data: ind.outputs[field] ?? [],
+        smooth: false,
+        showSymbol: false,
+        lineStyle: {color: ind.color, width: 1.5},
+        itemStyle: {color: ind.color},
+        xAxisIndex: gridIdx,
+        yAxisIndex: gridIdx,
+      })
+    }
+  })
+
+  return {grids, xAxes, yAxes, series, panelCount: panels.length}
+}
+
+// Ports buildOption from CandlestickChart.tsx: the main candlestick grid plus a
+// stacked grid per panel indicator. Overlays layer onto the price axis; panels add
+// their own grids/axes below. Every grid's x-axis shares the one dataZoom, so the
+// panels scroll with the candlesticks. Called fresh on chart:init (no indicators)
+// and rebuilt on chart:set_indicators.
+const buildOption = (ohlc, trades, indicators = []) => {
   const categoryData = ohlc.datetime
   const defaultStart = computeDefaultStart(categoryData.length)
+
+  const panels = buildPanelConfig(indicators)
+  const hasPanels = panels.panelCount > 0
+
+  // Push the main grid's bottom up to make room for the stacked panels + slider.
+  const mainGridBottom = hasPanels
+    ? `${DATA_ZOOM_HEIGHT + panels.panelCount * (PANEL_HEIGHT + PANEL_GAP) + DATA_ZOOM_HEIGHT}px`
+    : "15%"
+
+  // The dataZoom drives the main x-axis (0) plus each panel's x-axis.
+  const allXAxisIndices = [0, ...panels.xAxes.map((_, i) => i + 1)]
 
   return {
     animation: false,
     tooltip: {trigger: "axis", axisPointer: {type: "cross"}},
-    grid: [{left: "3%", right: "3%", top: "5%", bottom: "15%"}],
+    grid: [{left: "3%", right: "3%", top: "5%", bottom: mainGridBottom}, ...panels.grids],
     xAxis: [
       {
         type: "category",
         data: categoryData,
         boundaryGap: false,
-        axisLabel: {formatter: (value) => formatDatetime(value)},
-        axisTick: {show: true},
+        // With panels, the bottom panel owns the datetime labels; hide the main one.
+        axisLabel: hasPanels ? {show: false} : {formatter: (value) => formatDatetime(value)},
+        axisTick: {show: !hasPanels},
       },
+      ...panels.xAxes,
     ],
-    yAxis: [{scale: true, splitArea: {show: true}}],
+    yAxis: [{scale: true, splitArea: {show: true}}, ...panels.yAxes],
     dataZoom: [
-      {type: "inside", start: defaultStart, end: 100, xAxisIndex: [0]},
-      {type: "slider", start: defaultStart, end: 100, bottom: "2%", xAxisIndex: [0]},
+      {type: "inside", start: defaultStart, end: 100, xAxisIndex: allXAxisIndices},
+      {type: "slider", start: defaultStart, end: 100, bottom: "2%", xAxisIndex: allXAxisIndices},
     ],
-    series: [buildCandleSeries(ohlc, trades)],
+    series: [
+      buildCandleSeries(ohlc, trades),
+      ...buildOverlaySeries(indicators),
+      ...panels.series,
+    ],
   }
 }
 
@@ -220,19 +328,28 @@ export default {
     window.addEventListener("resize", this._onResize)
   },
 
-  // Re-apply the overlay line series without disturbing the candlestick, trade
-  // markLines, axes or current zoom. replaceMerge on `series` drops any overlay
-  // whose instance was removed; the candlestick is re-sent (same id) so it stays,
-  // and dataZoom/axes (not in the merge set) keep the user's current view.
+  // Re-apply the indicators (overlays + panels) without disturbing the user's zoom.
+  // Mirrors the CandlestickChart.tsx update effect: rebuild the full option and
+  // replaceMerge the series + grids + axes, so panels are added/removed and the
+  // grids reflow; the candlestick (re-sent at index 0) and trade markLines stay.
+  // The element grows with the panel count so the candlesticks stay usable.
   renderIndicators() {
     if (!this.chart || !this.ohlc) return
 
-    const series = [
-      buildCandleSeries(this.ohlc, this.trades),
-      ...this.indicators.map(buildIndicatorSeries),
-    ]
+    const panelCount = this.indicators.filter((ind) => ind.display === "panel").length
+    this.el.style.height = `${CHART_BASE_HEIGHT + panelCount * PANEL_CONTAINER_GROWTH}px`
 
-    this.chart.setOption({series}, {replaceMerge: ["series"]})
+    const option = buildOption(this.ohlc, this.trades, this.indicators)
+
+    // dataZoom is merged (not replaced), but its xAxisIndex set changes as panels
+    // come and go — so rebuild it, carrying over the current start/end zoom window.
+    const current = this.chart.getOption()
+    const start = current.dataZoom?.[0]?.start ?? 0
+    const end = current.dataZoom?.[0]?.end ?? 100
+    option.dataZoom = option.dataZoom.map((dz) => ({...dz, start, end}))
+
+    this.chart.setOption(option, {replaceMerge: ["series", "grid", "xAxis", "yAxis"]})
+    this.chart.resize()
   },
 
   destroyed() {

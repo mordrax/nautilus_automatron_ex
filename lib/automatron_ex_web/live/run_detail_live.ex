@@ -146,12 +146,14 @@ defmodule AutomatronExWeb.RunDetailLive do
   end
 
   # The per-instance form fires on any change, carrying the row id (hidden) plus
-  # the current period + color; apply both (idempotent for the unchanged one).
+  # the type's params + color; apply each (idempotent for the unchanged ones).
   # The id field is "indicator_id" (not "id") to avoid shadowing the form's DOM id.
   def handle_event("update_indicator", %{"indicator_id" => id} = params, socket) do
+    registry = socket.assigns.registry
+
     indicators =
       Enum.map(socket.assigns.indicators, fn
-        %{id: ^id} = instance -> apply_edit(instance, params)
+        %{id: ^id} = instance -> apply_edit(instance, params, registry)
         instance -> instance
       end)
 
@@ -193,16 +195,22 @@ defmodule AutomatronExWeb.RunDetailLive do
   end
 
   # Persisted instances cross the jsonb boundary string-keyed; bring them back to
-  # the atom-keyed %{id, type, params: %{period}, color} shape the sidebar renders
-  # and `Indicators.compute/2` consumes.
+  # the %{id, type, params, color} shape the sidebar renders and `Indicators.compute/2`
+  # consumes. Params stay string-keyed so every type's whole param set round-trips
+  # (MACD's fast/slow, Stochastics' k/d), not just a single `period`.
   defp normalize_instance(instance) do
     %{
       id: fetch(instance, "id"),
       type: fetch(instance, "type"),
-      params: %{period: fetch(instance, ["params", "period"])},
+      params: normalize_params(fetch(instance, "params")),
       color: fetch(instance, "color")
     }
   end
+
+  defp normalize_params(params) when is_map(params),
+    do: Map.new(params, fn {key, value} -> {to_string(key), value} end)
+
+  defp normalize_params(_), do: %{}
 
   defp build_instance(type, existing, registry) do
     spec = Enum.find(registry, &(&1.type == type))
@@ -210,25 +218,51 @@ defmodule AutomatronExWeb.RunDetailLive do
     %{
       id: "ind-" <> Integer.to_string(System.unique_integer([:positive])),
       type: type,
-      params: %{period: default_period(spec)},
+      params: default_params(spec),
       color: Enum.at(@palette, rem(length(existing), length(@palette)))
     }
   end
 
-  defp apply_edit(instance, params) do
+  # Seed every param the type's registry schema declares with its default, string-keyed
+  # (e.g. MACD -> %{"fast_period" => 12, "slow_period" => 26}), so a multi-param panel
+  # indicator computes the moment it's added — not just single-`period` overlays.
+  defp default_params(nil), do: %{}
+  defp default_params(spec), do: Map.new(spec.params, &{&1.name, &1.default})
+
+  # The per-instance form fires every declared param plus the color on change; apply
+  # each param (clamped to its own registry range) and the color. Threading the
+  # registry is what lets MACD's fast/slow and Stochastics' k/d be edited, not only
+  # a single `period`.
+  defp apply_edit(instance, params, registry) do
+    spec = Enum.find(registry, &(&1.type == instance.type))
+
     instance
-    |> edit_period(params["period"])
+    |> edit_params(params, spec)
     |> edit_color(params["color"])
   end
 
-  defp edit_period(instance, raw) when is_binary(raw) do
+  defp edit_params(instance, _params, nil), do: instance
+
+  defp edit_params(instance, params, spec) do
+    updated =
+      Enum.reduce(spec.params, instance.params, fn schema, acc ->
+        case edit_param_value(params[schema.name], schema) do
+          {:ok, value} -> Map.put(acc, schema.name, value)
+          :skip -> acc
+        end
+      end)
+
+    %{instance | params: updated}
+  end
+
+  defp edit_param_value(raw, schema) when is_binary(raw) do
     case Integer.parse(raw) do
-      {period, _} -> put_in(instance.params.period, clamp_period(period))
-      :error -> instance
+      {value, _} -> {:ok, value |> max(schema.min) |> min(schema.max)}
+      :error -> :skip
     end
   end
 
-  defp edit_period(instance, _), do: instance
+  defp edit_param_value(_raw, _schema), do: :skip
 
   defp edit_color(instance, color) when is_binary(color) and color != "",
     do: %{instance | color: color}
@@ -284,16 +318,14 @@ defmodule AutomatronExWeb.RunDetailLive do
 
   defp known_type?(registry, type), do: Enum.any?(registry, &(&1.type == type))
 
-  defp default_period(nil), do: 20
-
-  defp default_period(spec) do
-    case Enum.find(spec.params, &(&1.name == "period")) do
-      %{default: default} -> default
-      _ -> 20
+  # The param schema for a type, driving the per-instance number inputs (one per
+  # param, so MACD/Stochastics render both of theirs). Unknown type -> no inputs.
+  defp params_for(registry, type) do
+    case Enum.find(registry, &(&1.type == type)) do
+      %{params: params} -> params
+      _ -> []
     end
   end
-
-  defp clamp_period(period), do: period |> max(2) |> min(500)
 
   # Fetch a (possibly nested) key from a string-keyed jsonb map, tolerating
   # atom-keyed maps too (instances may already be atom-keyed in-process).
@@ -453,18 +485,19 @@ defmodule AutomatronExWeb.RunDetailLive do
                   <form
                     id={"indicator-#{ind.id}"}
                     phx-change="update_indicator"
-                    class="flex items-center gap-2"
+                    class="flex flex-wrap items-center gap-2"
                   >
                     <input type="hidden" name="indicator_id" value={ind.id} />
                     <span class="badge badge-soft badge-neutral font-mono text-xs">{ind.type}</span>
                     <input
+                      :for={p <- params_for(@registry, ind.type)}
                       type="number"
-                      name="period"
-                      value={ind.params.period}
-                      min="2"
-                      max="500"
-                      aria-label={"#{ind.type} period"}
-                      class="input input-xs w-16"
+                      name={p.name}
+                      value={Map.get(ind.params, p.name)}
+                      min={p.min}
+                      max={p.max}
+                      aria-label={"#{ind.type} #{p.name}"}
+                      class="input input-xs w-14"
                     />
                     <input
                       type="color"
@@ -488,7 +521,7 @@ defmodule AutomatronExWeb.RunDetailLive do
               </ul>
 
               <p :if={@indicators == []} class="mt-3 text-sm text-base-content/70">
-                No overlays yet — add SMA, EMA or HMA above.
+                No indicators yet — add a moving-average overlay or an oscillator panel above.
               </p>
             </div>
           </aside>
