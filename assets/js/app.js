@@ -24,13 +24,14 @@ import {Socket} from "phoenix"
 import {LiveSocket} from "phoenix_live_view"
 import {hooks as colocatedHooks} from "phoenix-colocated/automatron_ex"
 import CandlestickChart from "./hooks/candlestick_chart"
+import TradeHotkeys from "./hooks/trade_hotkeys"
 import topbar from "../vendor/topbar"
 
 const csrfToken = document.querySelector("meta[name='csrf-token']").getAttribute("content")
 const liveSocket = new LiveSocket("/live", Socket, {
   longPollFallbackMs: 2500,
   params: {_csrf_token: csrfToken},
-  hooks: {...colocatedHooks, CandlestickChart},
+  hooks: {...colocatedHooks, CandlestickChart, TradeHotkeys},
 })
 
 // Show progress bar on live navigation and form submits

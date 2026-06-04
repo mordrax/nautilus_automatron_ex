@@ -57,6 +57,23 @@ defmodule AutomatronExWeb.RunDetailLiveTest do
     assert_push_event(lv, "chart:focus_trade", %{index: 0})
   end
 
+  test "next_trade_fast / prev_trade_fast jump 50 trades and clamp at the bounds",
+       %{conn: conn} do
+    {:ok, lv, _html} = live(conn, ~p"/runs/#{@run}")
+
+    # CapsLock+Shift+Arrow (mirroring the React use-hotkeys fast step of 50) jumps
+    # 50 trades at a time. The fixture run has 204 trades, so +50 from 0 lands on 50.
+    render_hook(lv, "next_trade_fast", %{})
+    assert_push_event(lv, "chart:focus_trade", %{index: 50})
+
+    render_hook(lv, "prev_trade_fast", %{})
+    assert_push_event(lv, "chart:focus_trade", %{index: 0})
+
+    # Clamped at the lower bound — a fast jump never underflows below the first trade.
+    render_hook(lv, "prev_trade_fast", %{})
+    assert_push_event(lv, "chart:focus_trade", %{index: 0})
+  end
+
   test "on connected mount, focuses the initial trade so the chart opens on trade #1",
        %{conn: conn} do
     {:ok, lv, _html} = live(conn, ~p"/runs/#{@run}")
@@ -65,6 +82,21 @@ defmodule AutomatronExWeb.RunDetailLiveTest do
     # trade (#1 → index 0), matching the React reference (nae-g9c). Without it the
     # chart opens on the most-recent bars while the navigator reads "Trade 1".
     assert_push_event(lv, "chart:focus_trade", %{index: 0})
+  end
+
+  test "navigator wires the TradeHotkeys hook and Prev/Next carry shortcut tooltips",
+       %{conn: conn} do
+    {:ok, lv, _html} = live(conn, ~p"/runs/#{@run}")
+
+    nav = lv |> element("#trade-navigator") |> render()
+
+    # The CapsLock+arrow keyboard navigation is driven by the TradeHotkeys JS hook.
+    assert nav =~ ~s(phx-hook="TradeHotkeys")
+    # Prev/Next expose their shortcut as a hover tooltip (mentions the Shift fast jump).
+    assert nav =~ "CapsLock+←"
+    assert nav =~ "CapsLock+Shift+←"
+    assert nav =~ "CapsLock+→"
+    assert nav =~ "CapsLock+Shift+→"
   end
 
   test "chart container stays phx-update=ignore across trade navigation", %{conn: conn} do

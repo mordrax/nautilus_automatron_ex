@@ -102,6 +102,14 @@ defmodule AutomatronExWeb.RunDetailLive do
   def handle_event("next_trade", _params, socket),
     do: {:noreply, focus_trade(socket, socket.assigns.current_index + 1)}
 
+  # Fast step (±50) — CapsLock+Shift+Arrow in the TradeHotkeys hook, mirroring the
+  # React use-hotkeys fast jump. `focus_trade` clamps, so the bounds are safe.
+  def handle_event("prev_trade_fast", _params, socket),
+    do: {:noreply, focus_trade(socket, socket.assigns.current_index - 50)}
+
+  def handle_event("next_trade_fast", _params, socket),
+    do: {:noreply, focus_trade(socket, socket.assigns.current_index + 50)}
+
   # Clamp the requested trade index into range, remember it, and tell the chart
   # hook to zoom to it.
   defp focus_trade(socket, index) do
@@ -125,7 +133,7 @@ defmodule AutomatronExWeb.RunDetailLive do
   @impl true
   def render(assigns) do
     ~H"""
-    <Layouts.app flash={@flash}>
+    <Layouts.app flash={@flash} max_width="max-w-none">
       <div :if={@not_found}>
         <.header>
           Run not found
@@ -171,9 +179,15 @@ defmodule AutomatronExWeb.RunDetailLive do
             <div
               :if={@trades != []}
               id="trade-navigator"
+              phx-hook="TradeHotkeys"
               class="flex items-center justify-center gap-3 py-4"
             >
-              <.button class="btn btn-soft" phx-click="prev_trade" disabled={@current_index <= 0}>
+              <.button
+                class="btn btn-soft"
+                phx-click="prev_trade"
+                disabled={@current_index <= 0}
+                title="CapsLock+← (CapsLock+Shift+← jumps 50)"
+              >
                 ← Prev
               </.button>
               <span class="text-sm text-base-content/70">
@@ -183,13 +197,18 @@ defmodule AutomatronExWeb.RunDetailLive do
                 class="btn btn-soft"
                 phx-click="next_trade"
                 disabled={@current_index >= length(@trades) - 1}
+                title="CapsLock+→ (CapsLock+Shift+→ jumps 50)"
               >
                 Next →
               </.button>
             </div>
 
-            <div :if={@trades != []} class="overflow-x-auto">
-              <table class="table table-zebra table-sm">
+            <p :if={@trades != []} class="pb-2 text-center text-xs text-base-content/60">
+              Tip: turn on CapsLock, then ← / → to step trades (Shift+← / Shift+→ jumps 50).
+            </p>
+
+            <div :if={@trades != []} class="max-h-[28rem] overflow-auto">
+              <table class="table table-zebra table-sm table-pin-rows">
                 <thead>
                   <tr>
                     <th>#</th>
