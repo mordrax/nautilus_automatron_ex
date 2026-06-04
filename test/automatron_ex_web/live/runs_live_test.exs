@@ -146,13 +146,4 @@ defmodule AutomatronExWeb.RunsLiveTest do
       assert next =~ "Page 2 of 2"
     end
   end
-
-  describe "GET /runs/:run_id (Phase 2 placeholder)" do
-    test "renders a placeholder without crashing", %{conn: conn} do
-      {:ok, _view, html} = live(conn, ~p"/runs/#{@populated_run}")
-
-      assert html =~ @populated_run
-      assert html =~ "Phase 2"
-    end
-  end
 end
