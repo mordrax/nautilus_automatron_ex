@@ -14,6 +14,8 @@ defmodule AutomatronExWeb.RunDetailLiveTest do
 
   import Phoenix.LiveViewTest
 
+  alias AutomatronEx.Runs.ViewerState
+
   # Fixture facts (see test/support/fixtures/catalog/README.md):
   #   e4599dab-… — populated run, 204 closed positions / 408 fills (EMACross)
   @run "e4599dab-fd51-4758-9564-c2061bc2104e"
@@ -117,5 +119,92 @@ defmodule AutomatronExWeb.RunDetailLiveTest do
     assert html =~ "not found"
     assert html =~ "Back to runs"
     refute html =~ "204"
+  end
+
+  describe "indicator sidebar (Phase 3a)" do
+    test "replaces the inert Phase 3 placeholder with a functional add control",
+         %{conn: conn} do
+      {:ok, _lv, html} = live(conn, ~p"/runs/#{@run}")
+
+      # The add control offers the three overlay types from the registry.
+      assert html =~ ~s(phx-submit="add_indicator")
+      assert html =~ "SMA"
+      assert html =~ "EMA"
+      assert html =~ "HMA"
+
+      # The inert Phase-3 placeholder copy is gone.
+      refute html =~ "arrive in"
+    end
+
+    test "adding an overlay indicator computes its series and pushes chart:set_indicators",
+         %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/runs/#{@run}")
+
+      lv |> form("#add-indicator", %{"type" => "SMA"}) |> render_submit()
+
+      assert_push_event(lv, "chart:set_indicators", %{series: [series]})
+      assert series.label == "SMA(20)"
+      assert series.display == "overlay"
+      assert is_list(series.outputs["value"])
+      assert series.color =~ ~r/^#[0-9a-fA-F]{6}$/
+
+      # Persisted to viewer-state for the run.
+      assert [%{"type" => "SMA", "params" => %{"period" => 20}}] =
+               ViewerState.get_by_run!(@run).indicators
+    end
+
+    test "editing the period recomputes the series with the new label and persists it",
+         %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/runs/#{@run}")
+      lv |> form("#add-indicator", %{"type" => "SMA"}) |> render_submit()
+      assert_push_event(lv, "chart:set_indicators", %{series: [s]})
+
+      lv |> form("#indicator-#{s.id}", %{"period" => "50"}) |> render_change()
+
+      assert_push_event(lv, "chart:set_indicators", %{series: [s2]})
+      assert s2.label == "SMA(50)"
+      assert s2.id == s.id
+
+      assert [%{"params" => %{"period" => 50}}] = ViewerState.get_by_run!(@run).indicators
+    end
+
+    test "setting a color updates the pushed series and persists it", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/runs/#{@run}")
+      lv |> form("#add-indicator", %{"type" => "HMA"}) |> render_submit()
+      assert_push_event(lv, "chart:set_indicators", %{series: [s]})
+
+      lv |> form("#indicator-#{s.id}", %{"color" => "#123456"}) |> render_change()
+
+      assert_push_event(lv, "chart:set_indicators", %{series: [s2]})
+      assert s2.color == "#123456"
+      assert [%{"color" => "#123456"}] = ViewerState.get_by_run!(@run).indicators
+    end
+
+    test "removing an indicator drops it from the series and clears viewer-state",
+         %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/runs/#{@run}")
+      lv |> form("#add-indicator", %{"type" => "EMA"}) |> render_submit()
+      assert_push_event(lv, "chart:set_indicators", %{series: [s]})
+
+      lv |> element("#remove-#{s.id}") |> render_click()
+
+      assert_push_event(lv, "chart:set_indicators", %{series: []})
+      assert ViewerState.get_by_run!(@run).indicators == []
+    end
+
+    test "selections persist and are re-pushed on remount", %{conn: conn} do
+      {:ok, lv, _html} = live(conn, ~p"/runs/#{@run}")
+      lv |> form("#add-indicator", %{"type" => "EMA"}) |> render_submit()
+      assert_push_event(lv, "chart:set_indicators", %{series: [s]})
+
+      # A fresh LiveView for the same run reloads the persisted viewer-state:
+      # the instance renders again and its series is re-pushed after chart:init.
+      {:ok, lv2, _html2} = live(conn, ~p"/runs/#{@run}")
+
+      assert has_element?(lv2, "#indicator-#{s.id}")
+      assert_push_event(lv2, "chart:set_indicators", %{series: [s2]})
+      assert s2.id == s.id
+      assert s2.label == "EMA(20)"
+    end
   end
 end

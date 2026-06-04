@@ -11,14 +11,25 @@ defmodule AutomatronExWeb.RunDetailLive do
 
   Events: the navigator (`prev_trade`/`next_trade`) and a trade row / chart
   markLine click (`select_trade`) move the focused trade and push
-  `chart:focus_trade %{index}` so the chart zooms to it. An unknown run renders a
-  not-found message instead of crashing (the indicator sidebar is inert until
-  Phase 3).
+  `chart:focus_trade %{index}` so the chart zooms to it. The indicator sidebar
+  (Phase 3a) adds / removes / parametrizes SMA/EMA/HMA overlays: each change
+  recomputes via `AutomatronEx.Indicators.compute/2`, pushes
+  `chart:set_indicators %{series}` to the hook, and upserts the per-run
+  `AutomatronEx.Runs.ViewerState` so selections reload on the next mount. An
+  unknown run renders a not-found message instead of crashing.
   """
 
   use AutomatronExWeb, :live_view
 
+  require Logger
+
   alias AutomatronEx.Catalog.Reader
+  alias AutomatronEx.Indicators
+  alias AutomatronEx.Runs.ViewerState
+
+  # Per-instance default colors, cycled as overlays are added. Color also lives in
+  # viewer-state here (a documented divergence from the Python localStorage source).
+  @palette ~w(#2563eb #dc2626 #16a34a #d97706 #7c3aed #db2777)
 
   @impl true
   def mount(%{"run_id" => run_id}, _session, socket) do
@@ -32,6 +43,9 @@ defmodule AutomatronExWeb.RunDetailLive do
       |> assign(:bar_types, [])
       |> assign(:trades, [])
       |> assign(:current_index, 0)
+      |> assign(:registry, Indicators.registry())
+      |> assign(:indicators, load_indicators(run_id))
+      |> assign(:ohlc, empty_ohlc())
 
     {:ok, load_run(socket)}
   end
@@ -64,9 +78,11 @@ defmodule AutomatronExWeb.RunDetailLive do
       trades = read_trades(catalog, detail.run_id)
 
       socket
+      |> assign(:ohlc, ohlc)
       |> assign(:trades, trades)
       |> push_event("chart:init", %{ohlc: ohlc, trades: trades})
       |> push_event("chart:focus_trade", %{index: socket.assigns.current_index})
+      |> push_indicators()
     else
       socket
     end
@@ -110,6 +126,38 @@ defmodule AutomatronExWeb.RunDetailLive do
   def handle_event("next_trade_fast", _params, socket),
     do: {:noreply, focus_trade(socket, socket.assigns.current_index + 50)}
 
+  # --- indicator sidebar events --------------------------------------------
+
+  # Append a new overlay of the chosen type (seeded with its default period + a
+  # palette color), then recompute / push / persist. Unknown types are ignored.
+  def handle_event("add_indicator", %{"type" => type}, socket) do
+    if known_type?(socket.assigns.registry, type) do
+      instance = build_instance(type, socket.assigns.indicators, socket.assigns.registry)
+      socket = assign(socket, :indicators, socket.assigns.indicators ++ [instance])
+      {:noreply, sync_indicators(socket)}
+    else
+      {:noreply, socket}
+    end
+  end
+
+  def handle_event("remove_indicator", %{"id" => id}, socket) do
+    indicators = Enum.reject(socket.assigns.indicators, &(&1.id == id))
+    {:noreply, sync_indicators(assign(socket, :indicators, indicators))}
+  end
+
+  # The per-instance form fires on any change, carrying the row id (hidden) plus
+  # the current period + color; apply both (idempotent for the unchanged one).
+  # The id field is "indicator_id" (not "id") to avoid shadowing the form's DOM id.
+  def handle_event("update_indicator", %{"indicator_id" => id} = params, socket) do
+    indicators =
+      Enum.map(socket.assigns.indicators, fn
+        %{id: ^id} = instance -> apply_edit(instance, params)
+        instance -> instance
+      end)
+
+    {:noreply, sync_indicators(assign(socket, :indicators, indicators))}
+  end
+
   # Clamp the requested trade index into range, remember it, and tell the chart
   # hook to zoom to it.
   defp focus_trade(socket, index) do
@@ -129,6 +177,144 @@ defmodule AutomatronExWeb.RunDetailLive do
   defp clamp(index, _count) when index < 0, do: 0
   defp clamp(index, count) when index >= count, do: count - 1
   defp clamp(index, _count), do: index
+
+  # --- indicator helpers ----------------------------------------------------
+
+  # Load the run's persisted overlay selections (viewer-state) into the in-memory
+  # instance shape; an absent row (or any read error) means "no overlays".
+  defp load_indicators(run_id) do
+    case ViewerState.get_by_run(run_id) do
+      {:ok, %{indicators: instances}} when is_list(instances) ->
+        Enum.map(instances, &normalize_instance/1)
+
+      _ ->
+        []
+    end
+  end
+
+  # Persisted instances cross the jsonb boundary string-keyed; bring them back to
+  # the atom-keyed %{id, type, params: %{period}, color} shape the sidebar renders
+  # and `Indicators.compute/2` consumes.
+  defp normalize_instance(instance) do
+    %{
+      id: fetch(instance, "id"),
+      type: fetch(instance, "type"),
+      params: %{period: fetch(instance, ["params", "period"])},
+      color: fetch(instance, "color")
+    }
+  end
+
+  defp build_instance(type, existing, registry) do
+    spec = Enum.find(registry, &(&1.type == type))
+
+    %{
+      id: "ind-" <> Integer.to_string(System.unique_integer([:positive])),
+      type: type,
+      params: %{period: default_period(spec)},
+      color: Enum.at(@palette, rem(length(existing), length(@palette)))
+    }
+  end
+
+  defp apply_edit(instance, params) do
+    instance
+    |> edit_period(params["period"])
+    |> edit_color(params["color"])
+  end
+
+  defp edit_period(instance, raw) when is_binary(raw) do
+    case Integer.parse(raw) do
+      {period, _} -> put_in(instance.params.period, clamp_period(period))
+      :error -> instance
+    end
+  end
+
+  defp edit_period(instance, _), do: instance
+
+  defp edit_color(instance, color) when is_binary(color) and color != "",
+    do: %{instance | color: color}
+
+  defp edit_color(instance, _), do: instance
+
+  # Recompute every overlay, push the series to the chart hook, and persist the
+  # selection. Always pushes (even an empty list) so a removal clears the hook's
+  # overlay lines.
+  defp sync_indicators(socket) do
+    socket
+    |> persist_indicators()
+    |> push_event("chart:set_indicators", %{series: compute_series(socket)})
+  end
+
+  # On (re)connect, re-push the persisted overlays after `chart:init` so the hook
+  # re-draws them; nothing to do when there are no selections.
+  defp push_indicators(socket) do
+    case socket.assigns.indicators do
+      [] -> socket
+      _ -> push_event(socket, "chart:set_indicators", %{series: compute_series(socket)})
+    end
+  end
+
+  # `Indicators.compute/2` results carry no color (color is viewer-state, not
+  # compute output), so graft each instance's color back on by id for the hook.
+  defp compute_series(socket) do
+    instances = socket.assigns.indicators
+
+    socket.assigns.ohlc
+    |> Indicators.compute(instances)
+    |> Enum.map(&Map.put(&1, :color, color_for(&1.id, instances)))
+  end
+
+  defp persist_indicators(socket) do
+    case ViewerState.upsert(%{
+           run_id: socket.assigns.run_id,
+           indicators: socket.assigns.indicators
+         }) do
+      {:ok, _state} -> :ok
+      {:error, reason} -> Logger.warning("viewer-state upsert failed: #{inspect(reason)}")
+    end
+
+    socket
+  end
+
+  defp color_for(id, instances) do
+    case Enum.find(instances, &(&1.id == id)) do
+      %{color: color} -> color
+      _ -> nil
+    end
+  end
+
+  defp known_type?(registry, type), do: Enum.any?(registry, &(&1.type == type))
+
+  defp default_period(nil), do: 20
+
+  defp default_period(spec) do
+    case Enum.find(spec.params, &(&1.name == "period")) do
+      %{default: default} -> default
+      _ -> 20
+    end
+  end
+
+  defp clamp_period(period), do: period |> max(2) |> min(500)
+
+  # Fetch a (possibly nested) key from a string-keyed jsonb map, tolerating
+  # atom-keyed maps too (instances may already be atom-keyed in-process).
+  defp fetch(map, keys) when is_list(keys), do: Enum.reduce(keys, map, &fetch(&2, &1))
+
+  defp fetch(map, key) when is_map(map) do
+    case Map.fetch(map, key) do
+      {:ok, value} -> value
+      :error -> Map.get(map, safe_existing_atom(key))
+    end
+  end
+
+  defp fetch(_map, _key), do: nil
+
+  defp safe_existing_atom(key) when is_binary(key) do
+    String.to_existing_atom(key)
+  rescue
+    ArgumentError -> nil
+  end
+
+  defp safe_existing_atom(_key), do: nil
 
   @impl true
   def render(assigns) do
@@ -244,22 +430,67 @@ defmodule AutomatronExWeb.RunDetailLive do
           </div>
 
           <aside class="w-full shrink-0 lg:w-64">
-            <fieldset
-              disabled
-              aria-disabled="true"
-              class="rounded-box border border-base-300 p-4 opacity-60"
-            >
-              <legend class="px-1 text-sm font-semibold">Indicators</legend>
-              <p class="text-sm text-base-content/70">
-                Indicator overlays and key levels arrive in <span class="font-semibold">Phase 3</span>.
+            <div class="rounded-box border border-base-300 p-4">
+              <h2 class="px-1 text-sm font-semibold">Indicators</h2>
+
+              <form id="add-indicator" phx-submit="add_indicator" class="mt-3 flex gap-2">
+                <select
+                  name="type"
+                  aria-label="Indicator type"
+                  class="select select-bordered select-sm flex-1"
+                >
+                  <option :for={spec <- @registry} value={spec.type}>{spec.type}</option>
+                </select>
+                <button type="submit" class="btn btn-sm btn-primary">Add</button>
+              </form>
+
+              <ul :if={@indicators != []} class="mt-4 space-y-3">
+                <li
+                  :for={ind <- @indicators}
+                  id={"indicator-row-#{ind.id}"}
+                  class="rounded-box bg-base-200 p-2"
+                >
+                  <form
+                    id={"indicator-#{ind.id}"}
+                    phx-change="update_indicator"
+                    class="flex items-center gap-2"
+                  >
+                    <input type="hidden" name="indicator_id" value={ind.id} />
+                    <span class="badge badge-soft badge-neutral font-mono text-xs">{ind.type}</span>
+                    <input
+                      type="number"
+                      name="period"
+                      value={ind.params.period}
+                      min="2"
+                      max="500"
+                      aria-label={"#{ind.type} period"}
+                      class="input input-xs w-16"
+                    />
+                    <input
+                      type="color"
+                      name="color"
+                      value={ind.color}
+                      aria-label={"#{ind.type} color"}
+                      class="h-6 w-8 cursor-pointer rounded border border-base-300"
+                    />
+                    <button
+                      id={"remove-#{ind.id}"}
+                      type="button"
+                      phx-click="remove_indicator"
+                      phx-value-id={ind.id}
+                      aria-label={"Remove #{ind.type}"}
+                      class="btn btn-ghost btn-xs ml-auto"
+                    >
+                      ✕
+                    </button>
+                  </form>
+                </li>
+              </ul>
+
+              <p :if={@indicators == []} class="mt-3 text-sm text-base-content/70">
+                No overlays yet — add SMA, EMA or HMA above.
               </p>
-              <label class="mt-3 flex items-center gap-2 text-sm">
-                <input type="checkbox" class="checkbox checkbox-sm" disabled /> EMA
-              </label>
-              <label class="mt-2 flex items-center gap-2 text-sm">
-                <input type="checkbox" class="checkbox checkbox-sm" disabled /> Volume
-              </label>
-            </fieldset>
+            </div>
           </aside>
         </div>
       </div>

@@ -2,15 +2,17 @@
 //
 // Owns an eCharts instance and builds the same option object as the React app
 // (packages/client/src/components/chart/CandlestickChart.tsx + lib/chart-config,
-// lib/trade-utils, lib/chart-zoom, hooks/use-trades). Phase 2 scope: candlestick
-// + trade entry/exit markLines + zoom-to-trade. Indicators, key-levels and
-// secondary panels are deferred to Phase 3.
+// lib/trade-utils, lib/chart-zoom, hooks/use-trades). Candlestick + trade
+// entry/exit markLines + zoom-to-trade, plus Phase 3a overlay moving-average
+// indicators (SMA/EMA/HMA). Key-levels and secondary panels remain deferred to
+// later Phase 3 slices.
 //
 // Server contract (from RunDetailLive):
-//   chart:init        %{ohlc, trades}  -> (re)build and render the option
-//   chart:focus_trade %{index}         -> dataZoom centered on that trade
+//   chart:init           %{ohlc, trades}  -> (re)build and render the option
+//   chart:focus_trade    %{index}         -> dataZoom centered on that trade
+//   chart:set_indicators %{series}        -> add/update/remove overlay lines
 // Client -> server:
-//   select_trade      %{index}         -> a trade markLine was clicked
+//   select_trade         %{index}         -> a trade markLine was clicked
 import * as echarts from "echarts"
 
 // Mirrors CHART_COLORS in lib/chart-config.ts.
@@ -73,16 +75,66 @@ const buildTradeMarkLines = (trades) =>
     {coord: [trade.exit_datetime, trade.exit_price]},
   ])
 
-// Ports buildOption from CandlestickChart.tsx, Phase 2 subset (no indicator
-// overlays / key levels / panels). Candlestick rows are [open, close, low, high].
-const buildOption = (ohlc, trades) => {
-  const categoryData = ohlc.datetime
+// The candlestick series (rows are [open, close, low, high]) with its per-trade
+// entry->exit markLines. Carries a stable `id` so indicator updates can merge via
+// replaceMerge without rebuilding or disturbing it.
+const buildCandleSeries = (ohlc, trades) => {
   const ohlcValues = ohlc.open.map((_, i) => [
     ohlc.open[i],
     ohlc.close[i],
     ohlc.low[i],
     ohlc.high[i],
   ])
+
+  return {
+    id: "candlestick",
+    name: "Candlestick",
+    type: "candlestick",
+    data: ohlcValues,
+    itemStyle: {
+      color: CANDLE_UP,
+      color0: CANDLE_DOWN,
+      borderColor: CANDLE_UP_BORDER,
+      borderColor0: CANDLE_DOWN_BORDER,
+    },
+    markLine: {
+      symbol: ["none", "triangle"],
+      symbolSize: 10,
+      label: {
+        show: true,
+        formatter: (params) => params.data?.name ?? "",
+        position: "end",
+        fontSize: 10,
+      },
+      emphasis: {lineStyle: {width: 4}},
+      lineStyle: {type: "solid", width: 2},
+      data: buildTradeMarkLines(trades),
+    },
+  }
+}
+
+// One overlay line per indicator instance (the IndicatorResult shape pushed by
+// RunDetailLive), drawn on the price grid (xAxisIndex/yAxisIndex 0). Keyed by the
+// server-assigned instance id so add/update/remove map to eCharts series through
+// replaceMerge; `connectNulls` bridges the indicator's nil initialization prefix.
+const buildIndicatorSeries = (indicator) => ({
+  id: indicator.id,
+  name: indicator.label,
+  type: "line",
+  data: indicator.outputs?.value ?? [],
+  xAxisIndex: 0,
+  yAxisIndex: 0,
+  connectNulls: true,
+  showSymbol: false,
+  lineStyle: {color: indicator.color, width: 1.5},
+  itemStyle: {color: indicator.color},
+  z: 3,
+})
+
+// Ports buildOption from CandlestickChart.tsx (Phase 3a subset: overlay MAs, no
+// key levels / panels yet). Overlay lines are layered on by chart:set_indicators.
+const buildOption = (ohlc, trades) => {
+  const categoryData = ohlc.datetime
   const defaultStart = computeDefaultStart(categoryData.length)
 
   return {
@@ -103,32 +155,7 @@ const buildOption = (ohlc, trades) => {
       {type: "inside", start: defaultStart, end: 100, xAxisIndex: [0]},
       {type: "slider", start: defaultStart, end: 100, bottom: "2%", xAxisIndex: [0]},
     ],
-    series: [
-      {
-        name: "Candlestick",
-        type: "candlestick",
-        data: ohlcValues,
-        itemStyle: {
-          color: CANDLE_UP,
-          color0: CANDLE_DOWN,
-          borderColor: CANDLE_UP_BORDER,
-          borderColor0: CANDLE_DOWN_BORDER,
-        },
-        markLine: {
-          symbol: ["none", "triangle"],
-          symbolSize: 10,
-          label: {
-            show: true,
-            formatter: (params) => params.data?.name ?? "",
-            position: "end",
-            fontSize: 10,
-          },
-          emphasis: {lineStyle: {width: 4}},
-          lineStyle: {type: "solid", width: 2},
-          data: buildTradeMarkLines(trades),
-        },
-      },
-    ],
+    series: [buildCandleSeries(ohlc, trades)],
   }
 }
 
@@ -161,11 +188,20 @@ export default {
     this.chart = echarts.init(this.el)
     this.ohlc = null
     this.trades = []
+    this.indicators = []
 
     this.handleEvent("chart:init", ({ohlc, trades}) => {
       this.ohlc = ohlc
       this.trades = trades || []
+      // A fresh option clears any prior overlays; the server re-pushes the
+      // persisted ones via chart:set_indicators right after init.
+      this.indicators = []
       this.chart.setOption(buildOption(ohlc, this.trades), true)
+    })
+
+    this.handleEvent("chart:set_indicators", ({series}) => {
+      this.indicators = series || []
+      this.renderIndicators()
     })
 
     this.handleEvent("chart:focus_trade", ({index}) => {
@@ -182,6 +218,21 @@ export default {
 
     this._onResize = () => this.chart.resize()
     window.addEventListener("resize", this._onResize)
+  },
+
+  // Re-apply the overlay line series without disturbing the candlestick, trade
+  // markLines, axes or current zoom. replaceMerge on `series` drops any overlay
+  // whose instance was removed; the candlestick is re-sent (same id) so it stays,
+  // and dataZoom/axes (not in the merge set) keep the user's current view.
+  renderIndicators() {
+    if (!this.chart || !this.ohlc) return
+
+    const series = [
+      buildCandleSeries(this.ohlc, this.trades),
+      ...this.indicators.map(buildIndicatorSeries),
+    ]
+
+    this.chart.setOption({series}, {replaceMerge: ["series"]})
   },
 
   destroyed() {
