@@ -31,6 +31,11 @@ defmodule AutomatronExWeb.Layouts do
     default: nil,
     doc: "the current [scope](https://hexdocs.pm/phoenix/scopes.html)"
 
+  attr :max_width, :string,
+    default: "max-w-2xl",
+    doc:
+      ~s(Tailwind max-width class for the content container. Defaults to the narrow reading column; pass "max-w-none" for a full-width page such as the run detail.)
+
   slot :inner_block, required: true
 
   def app(assigns) do
@@ -63,7 +68,7 @@ defmodule AutomatronExWeb.Layouts do
     </header>
 
     <main class="px-4 py-20 sm:px-6 lg:px-8">
-      <div class="mx-auto max-w-2xl space-y-4">
+      <div class={["mx-auto space-y-4", @max_width]}>
         {render_slot(@inner_block)}
       </div>
     </main>
